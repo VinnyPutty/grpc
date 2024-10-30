@@ -34,6 +34,7 @@
 
 #include "absl/base/thread_annotations.h"
 #include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
@@ -63,13 +64,21 @@ using ::grpc_event_engine::experimental::EventEngine;
 class OrcaService::Reactor : public ServerWriteReactor<ByteBuffer>,
                              public grpc_core::RefCounted<Reactor> {
  public:
-  explicit Reactor(OrcaService* service, const ByteBuffer* request_buffer)
+  explicit Reactor(OrcaService* service, CallbackServerContext* ctx,
+                   const ByteBuffer* request_buffer)
       : RefCounted("OrcaService::Reactor"),
         service_(service),
         engine_(grpc_event_engine::experimental::GetDefaultEventEngine()) {
     // Get slice from request.
     Slice slice;
-    CHECK(request_buffer->DumpToSingleSlice(&slice).ok());
+    grpc::Status status = request_buffer->DumpToSingleSlice(&slice);
+    if (!status.ok()) {
+      LOG_EVERY_N_SEC(WARNING, 1)
+          << "OrcaService failed to extract request from peer: " << ctx->peer()
+          << " error:" << status.error_message();
+      Finish(Status(StatusCode::INTERNAL, status.error_message()));
+      return;
+    }
     // Parse request proto.
     upb::Arena arena;
     xds_service_orca_v3_OrcaLoadReportRequest* request =
@@ -77,6 +86,9 @@ class OrcaService::Reactor : public ServerWriteReactor<ByteBuffer>,
             reinterpret_cast<const char*>(slice.begin()), slice.size(),
             arena.ptr());
     if (request == nullptr) {
+      LOG_EVERY_N_SEC(WARNING, 1)
+          << "OrcaService failed to parse request proto from peer: "
+          << ctx->peer();
       Finish(Status(StatusCode::INTERNAL, "could not parse request proto"));
       return;
     }
@@ -177,8 +189,8 @@ OrcaService::OrcaService(ServerMetricRecorder* const server_metric_recorder,
       internal::RpcMethod::SERVER_STREAMING, /*handler=*/nullptr));
   MarkMethodCallback(
       0, new internal::CallbackServerStreamingHandler<ByteBuffer, ByteBuffer>(
-             [this](CallbackServerContext* /*ctx*/, const ByteBuffer* request) {
-               return new Reactor(this, request);
+             [this](CallbackServerContext* ctx, const ByteBuffer* request) {
+               return new Reactor(this, ctx, request);
              }));
 }
 
